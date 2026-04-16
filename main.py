@@ -2,24 +2,25 @@ import os
 import sqlite3
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional, List, Tuple
 
 from flask import Flask, jsonify
 from hydrogram import Client, filters
-from hydrogram.types import Message
+from hydrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 # =========================
 # BOT CONFIG
 # =========================
 BOT_NAME = "CS FARHANA"
 BOT_TAGLINE = "Customer Support Inbox Bot"
+CHANNEL_URL = "https://t.me/CSAirdropTeamBD"
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-PORT = int(os.getenv("PORT", "8080"))
+PORT = int(os.getenv("PORT", "10000"))
 
 if not API_ID or not API_HASH or not BOT_TOKEN or not OWNER_ID:
     raise ValueError("Missing env vars: API_ID, API_HASH, BOT_TOKEN, OWNER_ID")
@@ -37,8 +38,7 @@ logger = logging.getLogger("cs_farhana_bot")
 # FLASK APP
 # =========================
 web_app = Flask(__name__)
-
-BOT_START_TIME = datetime.utcnow()
+BOT_START_TIME = datetime.now(UTC)
 
 @web_app.route("/")
 def home():
@@ -46,13 +46,13 @@ def home():
 
 @web_app.route("/health")
 def health():
-    uptime_seconds = int((datetime.utcnow() - BOT_START_TIME).total_seconds())
+    uptime_seconds = int((datetime.now(UTC) - BOT_START_TIME).total_seconds())
     return jsonify({
         "status": "ok",
         "bot_name": BOT_NAME,
         "service": "telegram-support-bot",
         "uptime_seconds": uptime_seconds,
-        "time": datetime.utcnow().isoformat() + "Z"
+        "time": datetime.now(UTC).isoformat()
     })
 
 def run_web():
@@ -100,17 +100,10 @@ def init_db():
             )
         """)
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-
         conn.commit()
 
 def add_or_update_user(user_id: int, first_name: str = "", last_name: str = "", username: str = ""):
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(UTC).isoformat()
     with db_connect() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -133,6 +126,29 @@ def get_user(user_id: int) -> Optional[Tuple]:
             WHERE user_id = ?
         """, (user_id,))
         return cur.fetchone()
+
+def user_exists(user_id: int) -> bool:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM users WHERE user_id = ? LIMIT 1", (user_id,))
+        return cur.fetchone() is not None
+
+def is_banned(user_id: int) -> bool:
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT is_banned FROM users WHERE user_id = ? LIMIT 1", (user_id,))
+        row = cur.fetchone()
+        return bool(row[0]) if row else False
+
+def set_ban_status(user_id: int, status: bool):
+    with db_connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE users
+            SET is_banned = ?, updated_at = ?
+            WHERE user_id = ?
+        """, (1 if status else 0, datetime.now(UTC).isoformat(), user_id))
+        conn.commit()
 
 def get_total_users() -> int:
     with db_connect() as conn:
@@ -158,7 +174,7 @@ def get_all_active_user_ids() -> List[int]:
         """)
         return [row[0] for row in cur.fetchall()]
 
-def get_recent_users(limit: int = 10) -> List[Tuple]:
+def get_recent_users(limit: int = 15) -> List[Tuple]:
     with db_connect() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -169,36 +185,13 @@ def get_recent_users(limit: int = 10) -> List[Tuple]:
         """, (limit,))
         return cur.fetchall()
 
-def user_exists(user_id: int) -> bool:
-    with db_connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM users WHERE user_id = ? LIMIT 1", (user_id,))
-        return cur.fetchone() is not None
-
-def is_banned(user_id: int) -> bool:
-    with db_connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT is_banned FROM users WHERE user_id = ? LIMIT 1", (user_id,))
-        row = cur.fetchone()
-        return bool(row[0]) if row else False
-
-def set_ban_status(user_id: int, status: bool):
-    with db_connect() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE users
-            SET is_banned = ?, updated_at = ?
-            WHERE user_id = ?
-        """, (1 if status else 0, datetime.utcnow().isoformat(), user_id))
-        conn.commit()
-
 def save_reply_mapping(owner_message_id: int, user_id: int):
     with db_connect() as conn:
         cur = conn.cursor()
         cur.execute("""
             INSERT OR REPLACE INTO reply_map (owner_message_id, user_id, created_at)
             VALUES (?, ?, ?)
-        """, (owner_message_id, user_id, datetime.utcnow().isoformat()))
+        """, (owner_message_id, user_id, datetime.now(UTC).isoformat()))
         conn.commit()
 
 def get_target_user_id(owner_message_id: int) -> Optional[int]:
@@ -234,6 +227,13 @@ OWNER_COMMANDS = [
     "/msg", "/broadcast", "/ban", "/unban", "/id"
 ]
 
+def main_menu_buttons():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_URL)]
+        ]
+    )
+
 def is_owner_command(message: Message) -> bool:
     text = (message.text or message.caption or "").strip()
     return any(text.startswith(cmd) for cmd in OWNER_COMMANDS)
@@ -244,22 +244,26 @@ def format_name(first_name: str, last_name: str) -> str:
 def build_user_info(message: Message) -> str:
     user = message.from_user
     if not user:
-        return "New message received\n\nUser info unavailable."
+        return "📩 New message received.\n\n👤 User info unavailable."
 
     full_name = format_name(user.first_name, user.last_name)
     username = f"@{user.username}" if user.username else "No username"
 
     return (
-        f"New message in {BOT_NAME}\n\n"
-        f"Name: {full_name}\n"
-        f"Username: {username}\n"
-        f"User ID: {user.id}\n"
-        f"Chat ID: {message.chat.id}"
+        f"📩 New message in {BOT_NAME}\n\n"
+        f"👤 Name: {full_name}\n"
+        f"🔹 Username: {username}\n"
+        f"🆔 User ID: {user.id}\n"
+        f"💬 Chat ID: {message.chat.id}"
     )
 
-async def safe_reply(message: Message, text: str):
+async def safe_reply(message: Message, text: str, reply_markup=None):
     try:
-        await message.reply_text(text)
+        await message.reply_text(
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
     except Exception as e:
         logger.warning(f"Reply failed: {e}")
 
@@ -273,7 +277,7 @@ def parse_user_id_from_text(text: str) -> Optional[int]:
         return None
 
 # =========================
-# OWNER COMMANDS
+# START / HELP
 # =========================
 @bot.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
@@ -282,71 +286,95 @@ async def start_handler(client: Client, message: Message):
         add_or_update_user(user.id, user.first_name, user.last_name, user.username)
 
     if user and user.id == OWNER_ID:
-        await message.reply_text(
-            f"{BOT_NAME} owner panel ready.\n\n"
-            "Commands:\n"
-            "/users - show recent users\n"
-            "/stats - show bot stats\n"
-            "/msg user_id text - send direct text\n"
-            "Reply + /msg user_id - send replied content\n"
-            "/broadcast text - send to all active users\n"
-            "Reply + /broadcast - broadcast replied content\n"
-            "/ban user_id - ban a user\n"
-            "/unban user_id - unban a user\n"
-            "/id - get replied user's id\n\n"
-            "Also reply to copied user messages to answer them."
+        owner_text = (
+            f"🛠 {BOT_NAME} owner panel is ready.\n\n"
+            "📨 Users can send messages here.\n"
+            "👤 Reply to copied messages to answer them.\n"
+            "📊 Use /stats to check bot status.\n"
+            "📋 Use /users to see recent users.\n"
+            "🚫 Use /ban user_id to block a user.\n"
+            "✅ Use /unban user_id to unblock a user.\n"
+            "📩 Use /msg user_id text to send direct text.\n"
+            "📣 Reply with /broadcast to send updates."
         )
-    else:
-        if user and is_banned(user.id):
-            await message.reply_text("You are blocked from using this bot.")
-            return
+        await safe_reply(message, owner_text)
+        return
 
-        await message.reply_text(
-            f"Welcome to {BOT_NAME}.\n\n"
-            "Send your message here. It will be delivered to support."
-        )
+    if user and is_banned(user.id):
+        await safe_reply(message, "🚫 You are blocked from using this bot.")
+        return
+
+    welcome_text = (
+        f"🌸 Welcome to {BOT_NAME}.\n\n"
+        "💬 Send your message here anytime.\n"
+        "📨 Your message will be delivered to support.\n"
+        "⚡ Our team will review and reply as soon as possible.\n"
+        "🔒 Please avoid sending spam messages.\n"
+        "📢 Join our official channel below."
+    )
+
+    await safe_reply(
+        message,
+        welcome_text,
+        reply_markup=main_menu_buttons()
+    )
 
 @bot.on_message(filters.command("help") & filters.private)
 async def help_handler(client: Client, message: Message):
     user = message.from_user
+
     if user and user.id == OWNER_ID:
-        await message.reply_text(
-            "Owner help:\n\n"
-            "/users\n"
-            "/stats\n"
-            "/msg user_id your text\n"
-            "reply + /msg user_id\n"
-            "/broadcast your text\n"
-            "reply + /broadcast\n"
-            "/ban user_id\n"
-            "/unban user_id\n"
-            "/id\n\n"
-            "Reply directly to a copied user message to answer that user."
+        help_text = (
+            "🧩 Owner help menu.\n\n"
+            "📋 /users - show recent users.\n"
+            "📊 /stats - show bot statistics.\n"
+            "📩 /msg user_id text - send direct text.\n"
+            "🖼 Reply + /msg user_id - send replied content.\n"
+            "📣 /broadcast text - send to all users.\n"
+            "🔁 Reply + /broadcast - broadcast replied content.\n"
+            "🚫 /ban user_id - ban user.\n"
+            "✅ /unban user_id - unban user.\n"
+            "🆔 /id - get replied user's id."
         )
-    else:
-        if user and is_banned(user.id):
-            await message.reply_text("You are blocked from using this bot.")
-            return
+        await safe_reply(message, help_text)
+        return
 
-        await message.reply_text(
-            f"{BOT_NAME}\n\n"
-            "Send your message here. Our team will receive it."
-        )
+    if user and is_banned(user.id):
+        await safe_reply(message, "🚫 You are blocked from using this bot.")
+        return
 
+    public_help_text = (
+        f"🪄 {BOT_NAME} support guide.\n\n"
+        "💬 Send your message directly here.\n"
+        "📨 The support team will receive it.\n"
+        "⏳ Please wait politely for a reply.\n"
+        "📢 You can also join our official channel below."
+    )
+
+    await safe_reply(
+        message,
+        public_help_text,
+        reply_markup=main_menu_buttons()
+    )
+
+# =========================
+# OWNER COMMANDS
+# =========================
 @bot.on_message(filters.command("stats") & filters.private & filters.user(OWNER_ID))
 async def stats_handler(client: Client, message: Message):
     total_users = get_total_users()
     banned_users = get_banned_count()
     active_users = max(total_users - banned_users, 0)
-    uptime_seconds = int((datetime.utcnow() - BOT_START_TIME).total_seconds())
+    uptime_seconds = int((datetime.now(UTC) - BOT_START_TIME).total_seconds())
 
-    await message.reply_text(
-        f"{BOT_NAME} Stats\n\n"
-        f"Total users: {total_users}\n"
-        f"Active users: {active_users}\n"
-        f"Banned users: {banned_users}\n"
-        f"Uptime: {uptime_seconds} seconds"
+    stats_text = (
+        f"📊 {BOT_NAME} Stats\n\n"
+        f"👥 Total users: {total_users}\n"
+        f"✅ Active users: {active_users}\n"
+        f"🚫 Banned users: {banned_users}\n"
+        f"⏱ Uptime: {uptime_seconds} seconds"
     )
+    await safe_reply(message, stats_text)
 
 @bot.on_message(filters.command("users") & filters.private & filters.user(OWNER_ID))
 async def users_handler(client: Client, message: Message):
@@ -354,63 +382,64 @@ async def users_handler(client: Client, message: Message):
     total = get_total_users()
 
     if not users:
-        await message.reply_text("No users found.")
+        await safe_reply(message, "📭 No users found.")
         return
 
-    lines = [f"{BOT_NAME} Users", f"Total users: {total}", ""]
+    lines = [f"📋 {BOT_NAME} Users", f"👥 Total users: {total}", ""]
     for idx, row in enumerate(users, start=1):
         user_id, first_name, last_name, username, banned = row
         full_name = format_name(first_name, last_name)
         uname = f"@{username}" if username else "No username"
         status = "BANNED" if banned else "ACTIVE"
+
         lines.append(f"{idx}. {full_name}")
-        lines.append(f"   ID: {user_id}")
-        lines.append(f"   Username: {uname}")
-        lines.append(f"   Status: {status}")
+        lines.append(f"🆔 ID: {user_id}")
+        lines.append(f"🔹 Username: {uname}")
+        lines.append(f"📌 Status: {status}")
         lines.append("")
 
-    await message.reply_text("\n".join(lines).strip())
+    await safe_reply(message, "\n".join(lines).strip())
 
 @bot.on_message(filters.command("ban") & filters.private & filters.user(OWNER_ID))
 async def ban_handler(client: Client, message: Message):
     user_id = parse_user_id_from_text(message.text or "")
     if not user_id:
-        await message.reply_text("Usage:\n/ban user_id")
+        await safe_reply(message, "🚫 Usage:\n/ban user_id")
         return
 
     if not user_exists(user_id):
-        await message.reply_text("User not found in database.")
+        await safe_reply(message, "❌ User not found in database.")
         return
 
     set_ban_status(user_id, True)
-    await message.reply_text(f"User {user_id} banned.")
+    await safe_reply(message, f"🚫 User {user_id} banned.")
 
 @bot.on_message(filters.command("unban") & filters.private & filters.user(OWNER_ID))
 async def unban_handler(client: Client, message: Message):
     user_id = parse_user_id_from_text(message.text or "")
     if not user_id:
-        await message.reply_text("Usage:\n/unban user_id")
+        await safe_reply(message, "✅ Usage:\n/unban user_id")
         return
 
     if not user_exists(user_id):
-        await message.reply_text("User not found in database.")
+        await safe_reply(message, "❌ User not found in database.")
         return
 
     set_ban_status(user_id, False)
-    await message.reply_text(f"User {user_id} unbanned.")
+    await safe_reply(message, f"✅ User {user_id} unbanned.")
 
 @bot.on_message(filters.command("id") & filters.private & filters.user(OWNER_ID))
 async def id_handler(client: Client, message: Message):
     if not message.reply_to_message:
-        await message.reply_text("Reply to a copied user message first.")
+        await safe_reply(message, "🆔 Reply to a copied user message first.")
         return
 
     target_user_id = get_target_user_id(message.reply_to_message.id)
     if not target_user_id:
-        await message.reply_text("User ID not found for this message.")
+        await safe_reply(message, "❌ User ID not found for this message.")
         return
 
-    await message.reply_text(f"User ID: {target_user_id}")
+    await safe_reply(message, f"🆔 User ID: {target_user_id}")
 
 @bot.on_message(filters.command("msg") & filters.private & filters.user(OWNER_ID))
 async def msg_handler(client: Client, message: Message):
@@ -418,31 +447,29 @@ async def msg_handler(client: Client, message: Message):
         parts = (message.text or "").split(maxsplit=2)
 
         if len(parts) < 2:
-            await message.reply_text(
-                "Usage:\n"
-                "/msg user_id your message\n\n"
-                "Or reply to any message and use:\n"
-                "/msg user_id"
+            await safe_reply(
+                message,
+                "📩 Usage:\n/msg user_id your message\n\n🖼 Or reply to any message and use:\n/msg user_id"
             )
             return
 
         try:
             target_user_id = int(parts[1])
         except ValueError:
-            await message.reply_text("Invalid user_id.")
+            await safe_reply(message, "❌ Invalid user_id.")
             return
 
         if not user_exists(target_user_id):
-            await message.reply_text("This user is not in database yet.")
+            await safe_reply(message, "❌ This user is not in database yet.")
             return
 
         if is_banned(target_user_id):
-            await message.reply_text("This user is banned.")
+            await safe_reply(message, "🚫 This user is banned.")
             return
 
         if len(parts) >= 3 and parts[2].strip():
             await client.send_message(chat_id=target_user_id, text=parts[2].strip())
-            await message.reply_text("Direct message sent.")
+            await safe_reply(message, "✅ Direct message sent.")
             return
 
         if message.reply_to_message:
@@ -451,21 +478,21 @@ async def msg_handler(client: Client, message: Message):
                 from_chat_id=message.chat.id,
                 message_id=message.reply_to_message.id
             )
-            await message.reply_text("Replied content sent.")
+            await safe_reply(message, "✅ Replied content sent.")
             return
 
-        await message.reply_text("Nothing to send.")
+        await safe_reply(message, "❌ Nothing to send.")
 
     except Exception as e:
         logger.exception(f"/msg failed: {e}")
-        await message.reply_text("Failed to send direct message.")
+        await safe_reply(message, "❌ Failed to send direct message.")
 
 @bot.on_message(filters.command("broadcast") & filters.private & filters.user(OWNER_ID))
 async def broadcast_handler(client: Client, message: Message):
     try:
         user_ids = get_all_active_user_ids()
         if not user_ids:
-            await message.reply_text("No active users found.")
+            await safe_reply(message, "📭 No active users found.")
             return
 
         text_payload = None
@@ -477,15 +504,13 @@ async def broadcast_handler(client: Client, message: Message):
         elif message.reply_to_message:
             replied_payload = message.reply_to_message
         else:
-            await message.reply_text(
-                "Usage:\n"
-                "/broadcast your text\n\n"
-                "Or reply to a message and use:\n"
-                "/broadcast"
+            await safe_reply(
+                message,
+                "📣 Usage:\n/broadcast your text\n\n🔁 Or reply to a message and use:\n/broadcast"
             )
             return
 
-        status_msg = await message.reply_text("Broadcast started...")
+        status_msg = await message.reply_text("📤 Broadcast started...")
 
         success = 0
         failed = 0
@@ -506,14 +531,12 @@ async def broadcast_handler(client: Client, message: Message):
                 logger.warning(f"Broadcast failed for {user_id}: {e}")
 
         await status_msg.edit_text(
-            f"Broadcast completed.\n\n"
-            f"Success: {success}\n"
-            f"Failed: {failed}"
+            f"📣 Broadcast completed.\n\n✅ Success: {success}\n❌ Failed: {failed}"
         )
 
     except Exception as e:
         logger.exception(f"/broadcast failed: {e}")
-        await message.reply_text("Broadcast failed.")
+        await safe_reply(message, "❌ Broadcast failed.")
 
 # =========================
 # USER -> OWNER RELAY
@@ -526,7 +549,7 @@ async def relay_user_to_owner(client: Client, message: Message):
             add_or_update_user(user.id, user.first_name, user.last_name, user.username)
 
             if is_banned(user.id):
-                await safe_reply(message, "You are blocked from using this bot.")
+                await safe_reply(message, "🚫 You are blocked from using this bot.")
                 return
 
         await client.send_message(
@@ -543,11 +566,11 @@ async def relay_user_to_owner(client: Client, message: Message):
         save_reply_mapping(copied.id, message.chat.id)
         cleanup_old_reply_map()
 
-        await safe_reply(message, f"Your message has been sent to {BOT_NAME}.")
+        await safe_reply(message, f"✅ Your message has been sent to {BOT_NAME}.")
 
     except Exception as e:
         logger.exception(f"Relay failed: {e}")
-        await safe_reply(message, "Failed to send your message. Please try again later.")
+        await safe_reply(message, "❌ Failed to send your message. Please try again later.")
 
 # =========================
 # OWNER -> USER REPLY
@@ -567,7 +590,7 @@ async def owner_reply_handler(client: Client, message: Message):
             return
 
         if is_banned(target_user_id):
-            await message.reply_text("This user is banned.")
+            await safe_reply(message, "🚫 This user is banned.")
             return
 
         await client.copy_message(
@@ -576,11 +599,11 @@ async def owner_reply_handler(client: Client, message: Message):
             message_id=message.id
         )
 
-        await safe_reply(message, "Reply sent.")
+        await safe_reply(message, "✅ Reply sent.")
 
     except Exception as e:
         logger.exception(f"Owner reply failed: {e}")
-        await safe_reply(message, "Failed to send reply.")
+        await safe_reply(message, "❌ Failed to send reply.")
 
 # =========================
 # MAIN
